@@ -1,0 +1,7 @@
+{
+  "google_sheet_url": "https://docs.google.com/spreadsheets/d/1FYmDs2lKsrKQ_cye7xpUguuYAY2TsMK57GsFtYXTBhE/edit?gid=0#gid=0",
+  "interval": 1,
+  "unit": "分钟",
+  "cron": "*/1 * * * *",
+  "overlap": "skip"
+}

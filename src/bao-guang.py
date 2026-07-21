@@ -325,30 +325,22 @@ def scroll_until_stable(page: Page, delay: float = 2.0):
 
 
 def scroll_and_wait_new_elements(page: Page, selector: str, current_dom_count: int,
-                                  poll: float = 0.4, timeout: float = 8.0) -> int:
+                                  poll: float = 0.4, timeout: float = 3.0) -> int:
     """
-    滚动后等待：新容器数量 > current_dom_count 且所有容器都已填充文字内容。
-    防止容器骨架已插入 DOM 但 innerText 尚未渲染就提前解析。
+    滚动后等待：新容器数量 > current_dom_count 即立即返回。
+    只要求"出现新容器"，不再要求"所有容器都已填充文字"——后者在 FB 通用类名下
+    几乎永远不成立，会导致每次滚动都空耗满 timeout。骨架未渲染的元素外层
+    parse_view_count 会自动跳过，下一轮滚动会再次抓到。
     超时后直接返回当前数量，交给外层 no_new 计数判断是否到底。
     """
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(poll)
-        counts = page.evaluate(f"""
-            () => {{
-                const spans = document.querySelectorAll('{selector}');
-                let filled = 0;
-                for (const s of spans) {{
-                    if (s.innerText.trim()) filled++;
-                }}
-                return {{ total: spans.length, filled }};
-            }}
-        """)
-        total  = counts["total"]
-        filled = counts["filled"]
-        # 有新容器，且所有容器内容都已渲染完毕
-        if total > current_dom_count and filled >= total:
+        total = page.evaluate(
+            f"() => document.querySelectorAll('{selector}').length")
+        # 有新容器即返回
+        if total > current_dom_count:
             return total
     return len(page.query_selector_all(selector))
 
@@ -674,7 +666,7 @@ def scrape_facebook(urls: list[str], check_login: bool = True) -> dict[str, list
             results[url] = []
             continue
         time.sleep(4)
-        _wait_for_content(page, FB_VIEW_SELECTOR)
+        _wait_for_content(page, FB_VIEW_SELECTOR, timeout=5000)
 
         if _fb_page_has_login_wall(page):
             print(f"[FB] 检测到登录墙，跳过抓取，曝光量记为 -1：{url}")

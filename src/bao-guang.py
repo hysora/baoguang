@@ -1,7 +1,7 @@
 """
 bao-guang.py  —  多平台播放量/浏览量抓取
-支持：X (Twitter) · Instagram · Facebook · TikTok
-四个平台并行运行，各自使用独立浏览器 profile 保存登录状态。
+支持：X (Twitter) · Instagram · Facebook · TikTok · Threads
+各平台并行运行，各自使用独立浏览器 profile 保存登录状态。
 """
 
 from playwright.sync_api import sync_playwright, BrowserContext, Page
@@ -36,6 +36,8 @@ _PLATFORM_RULES = [
     ("instagram.com","Instagram"),
     ("facebook.com", "Facebook"),
     ("tiktok.com",   "TikTok"),
+    ("threads.com",  "Threads"),
+    ("threads.net",  "Threads"),
 ]
 
 def detect_platform(url: str) -> str | None:
@@ -96,14 +98,176 @@ PROFILE = {
     "x":        os.path.join(_BASE, ".profile_x"),
     "instagram": os.path.join(_BASE, ".profile_instagram"),
     "facebook": os.path.join(_BASE, ".profile_facebook"),
-    # TikTok 不使用持久化 profile（反爬较严，用全新浏览器）
+    "threads":  os.path.join(_BASE, ".profile_threads"),
+    "tiktok":   os.path.join(_BASE, ".profile_tiktok"),
 }
 
 # ── 持久化浏览器上下文（跨多次 main() 调用保持不关闭）──────────────
 # platform -> (playwright, BrowserContext, thread_id)
 _CTX_STORE: dict[str, tuple] = {}
-# TikTok 专用：[playwright, browser, BrowserContext, thread_id]
-_TT_STORE:  list = []
+
+# TikTok 的反爬能识别 Playwright 亲自启动的浏览器（表现为视频列表加载不出来，
+# 而同一个 profile 手动打开 Chrome 却一切正常）。因此 TikTok 改成：
+# 用和「登录」按钮完全相同的方式启动普通 Chrome，只多开一个调试端口，
+# 再让 Playwright 通过 CDP 附加上去，浏览器本身没有任何自动化启动参数。
+TIKTOK_CDP_PORT = 9222
+# {"playwright":..., "browser":..., "context":...}
+_TT_CDP: dict = {}
+# Chrome 进程句柄，CDP 关不掉时用来兜底结束进程
+_TT_PROC = None
+
+
+def _is_port_open(port: int, host: str = "127.0.0.1") -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def _launch_plain_chrome(profile_dir: str, url: str, debug_port: int | None = None):
+    """用普通 Chrome 打开（不带任何自动化标志），cookie 落在共用 profile 目录"""
+    import subprocess
+    args = [CHROME_PATH, f"--user-data-dir={profile_dir}",
+            "--no-first-run", "--no-default-browser-check"]
+    if debug_port:
+        args.append(f"--remote-debugging-port={debug_port}")
+    args.append(url)
+    return subprocess.Popen(args)
+
+
+# 命令行开标签后，留给页面自行加载、拿到 item_list 数据的时间（秒）
+TIKTOK_PAGE_SETTLE = 6.0
+
+
+def _tiktok_ensure_chrome():
+    """确保带调试端口的 Chrome 已在运行（只启动，不附加）"""
+    global _TT_PROC
+    if _is_port_open(TIKTOK_CDP_PORT):
+        return
+    print(f"[TIKTOK] 启动 Chrome（调试端口 {TIKTOK_CDP_PORT}）...")
+    _TT_PROC = _launch_plain_chrome(PROFILE["tiktok"], "about:blank", TIKTOK_CDP_PORT)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if _is_port_open(TIKTOK_CDP_PORT):
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"Chrome 调试端口 {TIKTOK_CDP_PORT} 未就绪。"
+        "若已有使用同一 profile 的 Chrome 窗口开着，请先全部关闭再重试。")
+
+
+def _attach_tiktok() -> tuple:
+    """附加到已在运行的 Chrome，返回 (playwright, context)"""
+    if _TT_CDP:
+        ctx = _TT_CDP.get("context")
+        if ctx is not None and _is_context_alive(ctx):
+            return _TT_CDP["playwright"], ctx
+        _close_tiktok_cdp()
+
+    p = sync_playwright().start()
+    browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{TIKTOK_CDP_PORT}")
+    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+    _TT_CDP.update({"playwright": p, "browser": browser, "context": ctx})
+    return p, ctx
+
+
+def _tiktok_open_tab(url: str):
+    """
+    用命令行让已运行的 Chrome 在新标签页打开 URL。
+    关键：此刻不能有 CDP 连接——webmssdk 在页面初始化时检测调试连接，
+    一旦被发现就生成废签名（X-Bogus=1），item_list 会返回 200 + 空 body。
+    """
+    _launch_plain_chrome(PROFILE["tiktok"], url)
+
+
+def _tiktok_click_sort_popular(page: Page) -> bool:
+    """
+    切换到「热门」排序，借此重新发起一次列表请求。
+    默认的「最新」排序在自动化环境下可能拿不到数据（签名被判废，
+    item_list 返回 200 + 空 body），而切排序能正常加载出来。
+    抓播放量不关心视频顺序，用哪种排序都一样。
+    """
+    try:
+        page.wait_for_selector("#user-post-sort-control button", timeout=10000)
+    except Exception:
+        return False
+    btns = page.query_selector_all("#user-post-sort-control button")
+    # aria-label 随界面语言变化，命中不了就退回按位置取（最新 \ 热门 \ 最旧）
+    for b in btns:
+        label = (b.get_attribute("aria-label") or "").strip()
+        if label in ("热门", "熱門", "Popular"):
+            b.click()
+            return True
+    if len(btns) >= 2:
+        btns[1].click()
+        return True
+    return False
+
+
+def _tiktok_find_page(ctx, url: str):
+    """在已打开的标签页中找到目标 URL 对应的页面"""
+    target = url.split("?")[0].rstrip("/").lower()
+    for pg in ctx.pages:
+        try:
+            if pg.url.split("?")[0].rstrip("/").lower() == target:
+                return pg
+        except Exception:
+            continue
+    return None
+
+
+def _close_tiktok_cdp():
+    """
+    只断开 CDP 连接，浏览器留着。
+    抓每个账号之间都要断开一次（下一个账号的页面必须在无调试连接的状态下加载），
+    整轮结束才调 _quit_tiktok_chrome() 真正退出浏览器。
+    """
+    browser = _TT_CDP.get("browser")
+    p = _TT_CDP.get("playwright")
+    _TT_CDP.clear()
+    try:
+        if browser is not None:
+            browser.close()
+    except Exception:
+        pass
+    try:
+        if p is not None:
+            p.stop()
+    except Exception:
+        pass
+
+
+def _quit_tiktok_chrome():
+    """关闭 TikTok 的 Chrome，与其它平台跑完即关闭浏览器的行为保持一致"""
+    global _TT_PROC
+    if not _TT_CDP and not _is_port_open(TIKTOK_CDP_PORT):
+        _TT_PROC = None
+        return
+    # 优先走 CDP 让 Chrome 正常退出，这样 profile（含登录 cookie）能正确落盘
+    try:
+        if not _TT_CDP:
+            _attach_tiktok()
+        browser = _TT_CDP.get("browser")
+        if browser is not None:
+            browser.new_browser_cdp_session().send("Browser.close")
+    except Exception:
+        pass
+    _close_tiktok_cdp()
+
+    # 等 Chrome 退出；超时则直接结束进程兜底
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not _is_port_open(TIKTOK_CDP_PORT):
+            _TT_PROC = None
+            return
+        time.sleep(0.5)
+    if _TT_PROC is not None:
+        try:
+            if _TT_PROC.poll() is None:
+                _TT_PROC.terminate()
+        except Exception:
+            pass
+        _TT_PROC = None
 
 
 def _is_context_alive(ctx) -> bool:
@@ -156,39 +320,6 @@ def _ensure_context(platform: str) -> tuple:
     return p, ctx
 
 
-def _ensure_tiktok() -> tuple:
-    """返回 TikTok 的 (playwright, browser, context)；context 失效时才重建，存活则直接复用。"""
-    current_tid = threading.get_ident()
-    if _TT_STORE:
-        p, browser, ctx, tid = _TT_STORE
-        if _is_context_alive(ctx):
-            _TT_STORE[3] = current_tid
-            return p, browser, ctx
-        try:
-            ctx.close()
-        except Exception:
-            pass
-        try:
-            p.stop()
-        except Exception:
-            pass
-        _TT_STORE.clear()
-
-    p = sync_playwright().start()
-    browser = p.chromium.launch(
-        executable_path=CHROME_PATH,
-        headless=False,
-        args=["--disable-blink-features=AutomationControlled"],
-    )
-    ctx = browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        locale="zh-CN",
-    )
-    ctx.add_init_script(_STEALTH_SCRIPT)
-    _TT_STORE.extend([p, browser, ctx, current_tid])
-    return p, browser, ctx
-
-
 def _get_or_new_page(ctx):
     """复用 context 中第一个已有页面，没有则新建"""
     pages = ctx.pages
@@ -204,7 +335,6 @@ def open_login_page(platform: str):
     登录成功后 cookie 保存在与 Playwright 共用的持久化 profile 目录中，
     后续定时运行时 Playwright 会自动读取这些 cookie。
     """
-    import subprocess
     import webbrowser
 
     _PLATFORM_HOME = {
@@ -212,30 +342,35 @@ def open_login_page(platform: str):
         "instagram": "https://www.instagram.com",
         "facebook":  "https://www.facebook.com",
         "tiktok":    "https://www.tiktok.com",
+        "threads":   "https://www.threads.com",
     }
     url = _PLATFORM_HOME.get(platform)
     if not url:
         return
 
     profile_dir = PROFILE.get(platform)
-    if platform != "tiktok" and profile_dir and CHROME_PATH:
+    if profile_dir and CHROME_PATH:
         # 先释放 Playwright 对该 profile 目录的文件锁，否则普通 Chrome 会回退到临时 profile，
         # 导致登录 cookie 写不进共用目录
-        _close_platform_context(platform)
-        # 用普通 Chrome（不带 Playwright 自动化标志）打开，cookie 写入同一 profile
+        if platform == "tiktok":
+            _close_tiktok_cdp()
+        else:
+            _close_platform_context(platform)
+        # 用普通 Chrome（不带 Playwright 自动化标志）打开，cookie 写入同一 profile。
+        # TikTok 顺便带上调试端口，登录完不必关窗口，抓取时直接附加到这个浏览器。
         try:
-            subprocess.Popen([CHROME_PATH, f"--user-data-dir={profile_dir}", url])
+            _launch_plain_chrome(
+                profile_dir, url,
+                TIKTOK_CDP_PORT if platform == "tiktok" else None)
             print(f"[{platform.upper()}] Chrome 已打开 {url}")
             print(f"[{platform.upper()}] 请完成登录，关闭浏览器后 cookie 会自动保存，下次自动化运行即可使用。")
             return
         except Exception as e:
             print(f"[{platform.upper()}] 直接启动 Chrome 失败，回退到系统浏览器: {e}")
 
-    # TikTok 或回退：用系统默认浏览器打开
+    # 回退：用系统默认浏览器打开
     webbrowser.open(url)
     print(f"[{platform.upper()}] 已用系统浏览器打开 {url}，请手动完成登录。")
-    if platform == "tiktok":
-        print("[TIKTOK] 注意：TikTok 每次抓取使用全新浏览器，登录状态无法自动传递给自动化。")
 
 # Excel 写入锁（多平台并行时保护文件）
 _excel_lock = threading.Lock()
@@ -263,13 +398,17 @@ def parse_view_count(text: str) -> int | None:
     return None
 
 
-def safe_goto(page: Page, url: str):
-    """跳转页面，忽略内部重定向引发的导航中断异常；网络错误时每秒重试最多60次"""
+def safe_goto(page: Page, url: str, wait_until: str = "load"):
+    """
+    跳转页面，忽略内部重定向引发的导航中断异常；网络错误时每秒重试最多60次。
+    wait_until 可传 "domcontentloaded"/"commit"：SPA 站点的内容就绪判据是
+    wait_for_selector 而非 load 事件，等 load（要等完所有图片/视频）纯属浪费。
+    """
     deadline = time.time() + 60
     attempt = 0
     while True:
         try:
-            page.goto(url, wait_until="load", timeout=60000)
+            page.goto(url, wait_until=wait_until, timeout=60000)  # type: ignore[arg-type]
             return
         except Exception as e:
             err_str = str(e)
@@ -305,7 +444,13 @@ def make_context(p, platform: str) -> BrowserContext:
         user_data_dir=PROFILE[platform],
         executable_path=CHROME_PATH,
         headless=False,
-        args=["--disable-blink-features=AutomationControlled"],
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            # 多标签页并行加载时，后台标签会被 Chrome 节流导致 hydration 变慢
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+        ],
         viewport={"width": 1280, "height": 900},  # type: ignore[arg-type]
         locale="zh-CN",
     )
@@ -437,7 +582,7 @@ def scrape_x(urls: list[str], check_login: bool = True) -> dict[str, list[dict]]
                     continue
 
                 items.append({"index": len(items) + 1, "views": vc,
-                              "url": "https://x.com" + tid})
+                              "url": url, "href": "https://x.com" + tid})
 
             cur = len(items)
             print(f"[X]   已收集 {cur} 条原创推文...")
@@ -670,7 +815,7 @@ def scrape_facebook(urls: list[str], check_login: bool = True) -> dict[str, list
 
         if _fb_page_has_login_wall(page):
             print(f"[FB] 检测到登录墙，跳过抓取，曝光量记为 -1：{url}")
-            results[url] = [{"index": 1, "views": -1, "url": url}]
+            results[url] = [{"index": 1, "views": -1, "url": url, "href": ""}]
             continue
 
         seen: set[str] = set()
@@ -682,22 +827,23 @@ def scrape_facebook(urls: list[str], check_login: bool = True) -> dict[str, list
         while True:
             data = page.evaluate(f"""
                 () => {{
+                    const spans = document.querySelectorAll("{FB_VIEW_SELECTOR}");
                     const out = [];
-                    for (const span of document.querySelectorAll("{FB_VIEW_SELECTOR}")) {{
+                    spans.forEach((span, i) => {{
                         const text = span.innerText.trim();
-                        if (!text) continue;
+                        if (!text) return;
                         let el = span, reelHref = null;
-                        for (let i = 0; i < 15; i++) {{
+                        for (let j = 0; j < 15; j++) {{
                             el = el.parentElement;
                             if (!el) break;
                             const a = el.querySelector('a[href*="/reel/"]');
-                            if (a) {{ reelHref = a.getAttribute("href"); break; }}
+                            if (a) {{ reelHref = a.href; break; }}
                             if (el.tagName === "A" && (el.href || "").includes("/reel/")) {{
-                                reelHref = el.getAttribute("href"); break;
+                                reelHref = el.href; break;
                             }}
                         }}
-                        out.push({{ text, reelHref }});
-                    }}
+                        out.push({{ i, text, reelHref }});
+                    }});
                     return out;
                 }}
             """)
@@ -707,13 +853,14 @@ def scrape_facebook(urls: list[str], check_login: bool = True) -> dict[str, list
                 if vc is None:
                     continue
                 href = item.get("reelHref") or ""
-                # 有 reelHref 用链接去重；无 reelHref 用"文本+播放量"去重
-                key = href if href else f"nolink:{item.get('text')}"
+                # 无链接时按 DOM 位置去重，不能按文本——两条不同 Reel
+                # 播放量文本可能相同，按文本会被误判成重复而丢数据
+                key = href if href else f"idx:{item.get('i')}"
                 if key in seen:
                     continue
                 seen.add(key)
-                reel_url = ("https://www.facebook.com" + href) if href else "(未知链接)"
-                items.append({"index": len(items) + 1, "views": vc, "url": reel_url})
+                items.append({"index": len(items) + 1, "views": vc,
+                              "url": url, "href": href})
 
             cur = len(items)
             print(f"[FB]   已收集 {cur} 条 Reel...")
@@ -737,31 +884,81 @@ def scrape_facebook(urls: list[str], check_login: bool = True) -> dict[str, list
 # ──────────────────────────────────────────────
 
 def scrape_tiktok(urls: list[str], check_login: bool = True) -> dict[str, list[dict]]:  # noqa: check_login unused
+    """
+    TikTok 专用流程：页面必须由 Chrome 自己打开、加载完成后才允许附加 CDP。
+    check_login 在这里是空的——未登录同样能拿到播放量，而登录检查会提前
+    建立 CDP 连接，反而破坏上面这个时序。
+    """
     results: dict[str, list[dict]] = {}
-    _, _, context = _ensure_tiktok()
+    _tiktok_ensure_chrome()
 
     for url in urls:
         print(f"\n[TT] 正在访问：{url}")
-        page = context.new_page()
+        page = None
         try:
-            safe_goto(page, url)
-            page.wait_for_selector('[data-e2e="video-views"]', timeout=30000)
-            time.sleep(2)
+            # 第一步：无 CDP 连接状态下让 Chrome 自行打开并加载完页面
+            _close_tiktok_cdp()
+            _tiktok_open_tab(url)
+            time.sleep(TIKTOK_PAGE_SETTLE)
 
+            # 第二步：页面已加载完，此时再附加
+            _, context = _attach_tiktok()
+            page = _tiktok_find_page(context, url)
+            if page is None:
+                raise RuntimeError(f"未找到已打开的标签页：{url}")
+            page.bring_to_front()
+
+            try:
+                page.wait_for_selector('[data-e2e="video-views"]', timeout=15000)
+            except Exception:
+                print("[TT]   首屏没有播放量，切到「热门」排序重新触发加载...")
+                if not _tiktok_click_sort_popular(page):
+                    print("[TT]   没找到排序控件")
+                page.wait_for_selector('[data-e2e="video-views"]', timeout=20000)
+
+            seen: set[str] = set()
             items: list[dict] = []
             last_count = 0
             no_new = 0
 
             while True:
-                elements = page.query_selector_all('[data-e2e="video-views"]')
-                for el in elements[last_count:]:
-                    text = el.inner_text().strip()
-                    vc = parse_view_count(text)
-                    if vc is not None:
-                        items.append({"index": len(items) + 1, "views": vc, "url": url})
+                # 每个播放量元素向上第 2 层即可取到自己那条视频链接，
+                # 留 15 层余量防改版；带位置下标便于链接缺失时兜底去重。
+                data = page.evaluate("""
+                    () => {
+                        const els = document.querySelectorAll('[data-e2e="video-views"]');
+                        const out = [];
+                        els.forEach((el, i) => {
+                            const text = (el.innerText || "").trim();
+                            let cur = el, href = null;
+                            for (let j = 0; j < 15; j++) {
+                                cur = cur.parentElement;
+                                if (!cur) break;
+                                const a = cur.querySelector('a[href*="/video/"]');
+                                if (a) { href = a.href; break; }
+                            }
+                            out.push({ i, text, href });
+                        });
+                        return out;
+                    }
+                """)
 
-                cur = len(elements)
-                print(f"[TT]   已加载 {cur} 个视频...")
+                for entry in data:
+                    vc = parse_view_count(entry.get("text", ""))
+                    if vc is None:
+                        continue  # 骨架屏未渲染，下一轮滚动会再抓到
+                    href = entry.get("href") or ""
+                    # 无链接时按 DOM 位置去重，不能按文本——两条不同视频
+                    # 播放量文本可能相同，按文本会被误判成重复而丢数据
+                    key = href if href else f"idx:{entry.get('i')}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    items.append({"index": len(items) + 1, "views": vc,
+                                  "url": url, "href": href})
+
+                cur = len(data)
+                print(f"[TT]   已加载 {cur} 个视频，已收集 {len(items)} 条播放量...")
                 if cur == last_count:
                     no_new += 1
                     if no_new >= 3:
@@ -774,26 +971,251 @@ def scrape_tiktok(urls: list[str], check_login: bool = True) -> dict[str, list[d
 
             results[url] = items
         except Exception as e:
-            print(f"[TT] 网络错误，跳过当前账号，已保留 {len(results)} 个结果：{e}")
+            # 原来一律报"网络错误"，但选择器超时、风控拦截也会走到这里，会误导排查
+            print(f"[TT] 抓取失败，跳过当前账号，已保留 {len(results)} 个结果："
+                  f"{type(e).__name__}: {e}")
             results[url] = []
         finally:
-            page.close()
+            # 关掉本轮标签页，避免账号多时标签堆积
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
-    if _TT_STORE:
-        p, browser, ctx, _ = _TT_STORE
-        _TT_STORE.clear()
+    _quit_tiktok_chrome()
+    return results
+
+
+# ──────────────────────────────────────────────
+# Threads
+# ──────────────────────────────────────────────
+# 主页不显示浏览量，需先收集帖子链接再逐条进详情页提取。
+# 该类名同时用于导航/用户名等文本，必须配合"次浏览/views"文本模式过滤。
+THREADS_VIEW_SELECTOR = "span.x1lliihq.x193iq5w.x6ikm8r.x10wlt62.xlyipyv.xuxw1ft"
+_THREADS_VIEW_RE = re.compile(r'(次浏览|次瀏覽|views?)\s*$', re.IGNORECASE)
+_THREADS_POST_LINK = 'a[href*="/post/"]'
+_THREADS_PATH_RE = re.compile(r'/(@[^/]+)/post/([^/]+)')
+
+# 滚动收集的到底判据：连续这么多秒没有出现新帖子链接就结束
+_THREADS_NO_NEW_SECONDS = 10.0
+
+# 详情页并行标签数：N 个标签同时加载，再依次收割浏览量。
+# 若遇到限流/页面加载不稳，调回 1 即退化为原来的串行流程。
+THREADS_POST_CONCURRENCY = 4
+
+# 浏览量只是一个文本 span，图片/视频/字体全部不需要，拦掉可省去详情页大半加载时间
+_THREADS_BLOCK_TYPES = {"image", "media", "font"}
+
+
+def _threads_block_heavy(route):
+    try:
+        if route.request.resource_type in _THREADS_BLOCK_TYPES:
+            route.abort()
+        else:
+            route.continue_()
+    except Exception:
+        pass
+
+
+def _threads_ensure_login(page: Page):
+    safe_goto(page, "https://www.threads.com/", wait_until="domcontentloaded")
+    time.sleep(3)
+    if page.query_selector('a[href*="/login"]') is None:
+        print("[TH] 检测到已登录，直接开始抓取。")
+    else:
+        print("[TH] 尚未登录，请在浏览器中完成登录后按 Enter 继续...")
+        input()
+
+
+# 找到浏览量文本的 JS（找不到返回 null）。等待与提取共用同一判据：
+# THREADS_VIEW_SELECTOR 是通用类名，导航/用户名也命中，只等类名出现会在
+# 浏览量尚未渲染时就返回，必须以"文本匹配次浏览/views"为准。
+_THREADS_VIEW_FIND_JS = """
+    () => {
+        const pat = /(次浏览|次瀏覽|views?)\\s*$/i;
+        const hit = (list) => {
+            for (const span of list) {
+                const t = (span.innerText || "").trim();
+                if (t.length < 30 && pat.test(t)) return t;
+            }
+            return null;
+        };
+        // 第二个 hit 是兜底：类名可能随版本变化
+        return hit(document.querySelectorAll("%s")) || hit(document.querySelectorAll("span"));
+    }
+""" % THREADS_VIEW_SELECTOR
+
+
+def _threads_wait_views(page: Page, timeout: int = 15000):
+    """等到浏览量文本真正渲染出来。polling 必须显式给毫秒数：
+    默认的 raf 轮询在后台标签页会被暂停，并行加载时大部分标签都是后台的。"""
+    try:
+        page.wait_for_function(
+            f"() => ({_THREADS_VIEW_FIND_JS})() !== null",
+            timeout=timeout, polling=300)
+    except Exception:
+        pass
+
+
+def _threads_extract_views(page: Page) -> int | None:
+    """在帖子详情页提取浏览量（如 '3.3 万次浏览' / '1,234 views'），整页仅主帖一处"""
+    text = page.evaluate(_THREADS_VIEW_FIND_JS)
+    if not text:
+        return None
+    return parse_view_count(_THREADS_VIEW_RE.sub("", text).strip())
+
+
+def _threads_post_paths(page: Page) -> list[tuple[str, str]]:
+    """
+    取当前页面上的帖子链接，返回 [(path, account)]，path 形如 /@user/post/xxx。
+    去掉 query 并排除 /media 等子页。主页是虚拟滚动、DOM 节点会被回收重排，
+    所以一切"是否还有新内容"的判断都要基于这里的 path 集合，不能用 DOM 节点数。
+    """
+    from urllib.parse import urlparse
+    hrefs = page.evaluate(f"""
+        () => Array.from(document.querySelectorAll('{_THREADS_POST_LINK}'))
+                  .map(a => a.getAttribute('href'))
+    """) or []
+    out: list[tuple[str, str]] = []
+    for href in hrefs:
+        if not href:
+            continue
+        path = href.split("?")[0]
+        if path.startswith("http"):
+            path = urlparse(path).path
+        pm = _THREADS_PATH_RE.fullmatch(path)
+        if pm:
+            out.append((path, pm.group(1)))
+    return out
+
+
+def _threads_scroll_step(page: Page, seen: set[str],
+                         poll: float = 0.3, timeout: float = 4.0):
+    """滚动一屏并等到出现 seen 之外的新帖子链接就返回，避免固定 sleep + networkidle 空耗"""
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(poll)
         try:
-            ctx.close()
+            if any(p not in seen for p, _ in _threads_post_paths(page)):
+                return
+        except Exception:
+            return
+
+
+def _threads_collect_views(context, post_paths: list[str], src_url: str) -> list[dict]:
+    """
+    多标签并行取浏览量：先给每个标签发起导航（commit 即返回，加载在后台并行进行），
+    再依次等待各标签的浏览量 span 出现并提取。
+    """
+    items: list[dict] = []
+    if not post_paths:
+        return items
+
+    lanes = max(1, min(THREADS_POST_CONCURRENCY, len(post_paths)))
+    pages: list[Page] = [_get_or_new_page(context)]
+    extra: list[Page] = []
+    for _ in range(lanes - 1):
+        pg = context.new_page()
+        extra.append(pg)
+        pages.append(pg)
+
+    try:
+        # 在 context 上注册，对批次内所有标签（含后续新建）统一生效
+        context.route("**/*", _threads_block_heavy)
+
+        for start in range(0, len(post_paths), lanes):
+            batch = post_paths[start:start + lanes]
+            loaded: list[tuple[Page, str]] = []
+            # 阶段一：并行发起导航
+            for pg, path in zip(pages, batch):
+                post_url = "https://www.threads.com" + path
+                try:
+                    safe_goto(pg, post_url, wait_until="commit")
+                    loaded.append((pg, post_url))
+                except Exception as e:
+                    print(f"[TH] 帖子打开失败，跳过：{post_url}（{e}）")
+            # 阶段二：依次收割
+            for pg, post_url in loaded:
+                _threads_wait_views(pg)
+                try:
+                    vc = _threads_extract_views(pg)
+                except Exception as e:
+                    print(f"[TH] 帖子解析失败，跳过：{post_url}（{e}）")
+                    continue
+                if vc is None:
+                    print(f"[TH]   未找到浏览量：{post_url}")
+                    continue
+                items.append({"index": len(items) + 1, "views": vc,
+                              "url": src_url, "href": post_url})
+                print(f"[TH]   {len(items):>3}: {vc:>12,} 次  {post_url}")
+    finally:
+        try:
+            context.unroute("**/*", _threads_block_heavy)
         except Exception:
             pass
+        for pg in extra:
+            try:
+                pg.close()
+            except Exception:
+                pass
+    return items
+
+
+def scrape_threads(urls: list[str], check_login: bool = True) -> dict[str, list[dict]]:
+    results: dict[str, list[dict]] = {}
+    _, context = _ensure_context("threads")
+    page = _get_or_new_page(context)
+    if check_login:
+        _threads_ensure_login(page)
+
+    for url in urls:
+        print(f"\n[TH] 正在访问：{url}")
         try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            p.stop()
-        except Exception:
-            pass
+            safe_goto(page, url, wait_until="domcontentloaded")
+        except Exception as e:
+            print(f"[TH] 网络错误，跳过当前账号，已保留 {len(results)} 个结果：{e}")
+            results[url] = []
+            continue
+        _wait_for_content(page, _THREADS_POST_LINK)
+
+        # 从主页 URL 提取用户名，只收集该用户自己的帖子（转发的 href 是他人用户名）
+        m = re.search(r'threads\.(?:com|net)/(@[^/?#]+)', url)
+        account = m.group(1) if m else None
+
+        # 第一步：滚动主页收集帖子链接
+        post_paths: list[str] = []
+        seen_paths: set[str] = set()
+        # seen_any 含他人转发，作为"页面还在出新内容"的信号；只看 post_paths
+        # 会在连续几屏都是转发时误判到底
+        seen_any: set[str] = set()
+        last_printed = -1
+        last_progress = time.time()
+        while True:
+            for path, acc in _threads_post_paths(page):
+                if path not in seen_any:
+                    seen_any.add(path)
+                    last_progress = time.time()
+                if account and acc != account:
+                    continue
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                post_paths.append(path)
+
+            if len(post_paths) != last_printed:
+                print(f"[TH]   已收集 {len(post_paths)} 条帖子链接...")
+                last_printed = len(post_paths)
+            if time.time() - last_progress >= _THREADS_NO_NEW_SECONDS:
+                print(f"[TH]   {_THREADS_NO_NEW_SECONDS:.0f} 秒无新内容，"
+                      f"收集结束，共 {len(post_paths)} 条")
+                break
+            _threads_scroll_step(page, seen_any)
+
+        # 第二步：多标签并行访问帖子详情页，提取浏览量
+        results[url] = _threads_collect_views(context, post_paths, url)
+    _close_platform_context("threads")
     return results
 
 
@@ -828,7 +1250,8 @@ def print_results(platform: str, all_results: dict[str, list[dict]]):
         total = sum(i["views"] for i in items)
         print(f"\n  账号: {account}  共 {len(items)} 条内容")
         for item in items:
-            print(f"    {item['index']:>4}: {item['views']:>12,} 次  {item.get('url', '')}")
+            link = item.get("href") or item.get("url", "")
+            print(f"    {item['index']:>4}: {item['views']:>12,} 次  {link}")
         print(f"  合计: {total:,}")
 
 
@@ -837,7 +1260,8 @@ def print_results(platform: str, all_results: dict[str, list[dict]]):
 # ──────────────────────────────────────────────
 
 _PLATFORM_KW = ["x.com", "twitter.com", "instagram.com",
-                "facebook.com", "tiktok.com", "youtube.com"]
+                "facebook.com", "tiktok.com", "youtube.com",
+                "threads.com", "threads.net"]
 
 
 def _read_xlsx(xlsx_path: str, label: str = "Sheet") -> dict[str, dict]:
@@ -1193,6 +1617,7 @@ def main(check_login: bool = False, test_mode: bool = False):
         "Instagram": scrape_instagram,
         "Facebook":  scrape_facebook,
         "TikTok":    scrape_tiktok,
+        "Threads":   scrape_threads,
     }
 
     grouped = group_urls_by_platform(URLS)
@@ -1237,6 +1662,7 @@ def main(check_login: bool = False, test_mode: bool = False):
 
 def _close_all_contexts():
     """关闭所有平台的浏览器上下文"""
+    _quit_tiktok_chrome()
     for platform, entry in list(_CTX_STORE.items()):
         p, ctx, _ = entry
         try:
@@ -1248,22 +1674,6 @@ def _close_all_contexts():
         except Exception:
             pass
     _CTX_STORE.clear()
-
-    if _TT_STORE:
-        p, browser, ctx, _ = _TT_STORE
-        try:
-            ctx.close()
-        except Exception:
-            pass
-        try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            p.stop()
-        except Exception:
-            pass
-        _TT_STORE.clear()
 
 
 def _wait_until_next_8am():

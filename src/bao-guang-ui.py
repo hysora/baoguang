@@ -394,6 +394,7 @@ class App(tk.Tk):
             ("Facebook",  "facebook",  "#1877F2"),
             ("X (Twitter)", "x",       "#000000"),
             ("TikTok",    "tiktok",    "#010101"),
+            ("Threads",   "threads",   "#333333"),
         ]
         self._login_btns: dict[str, tk.Button] = {}
         for label, key, color in _LOGIN_PLATFORMS:
@@ -701,6 +702,7 @@ class App(tk.Tk):
                     "facebook":  "Facebook",
                     "x":         "X (Twitter)",
                     "tiktok":    "TikTok",
+                    "threads":   "Threads",
                 }
                 if btn:
                     self.after(0, lambda: btn.config(

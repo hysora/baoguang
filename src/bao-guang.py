@@ -1,6 +1,6 @@
 """
 bao-guang.py  —  多平台播放量/浏览量抓取
-支持：X (Twitter) · Instagram · Facebook · TikTok · Threads
+支持：Instagram · Facebook · TikTok
 各平台并行运行，各自使用独立浏览器 profile 保存登录状态。
 """
 
@@ -31,13 +31,9 @@ URL_META: dict[str, dict] = {}
 
 # 平台识别规则（域名关键词 → 平台名）
 _PLATFORM_RULES = [
-    ("x.com",        "X"),
-    ("twitter.com",  "X"),
     ("instagram.com","Instagram"),
     ("facebook.com", "Facebook"),
     ("tiktok.com",   "TikTok"),
-    ("threads.com",  "Threads"),
-    ("threads.net",  "Threads"),
 ]
 
 def detect_platform(url: str) -> str | None:
@@ -95,10 +91,8 @@ CHROME_PATH = _find_chrome()
 
 
 PROFILE = {
-    "x":        os.path.join(_BASE, ".profile_x"),
     "instagram": os.path.join(_BASE, ".profile_instagram"),
     "facebook": os.path.join(_BASE, ".profile_facebook"),
-    "threads":  os.path.join(_BASE, ".profile_threads"),
     "tiktok":   os.path.join(_BASE, ".profile_tiktok"),
 }
 
@@ -338,11 +332,9 @@ def open_login_page(platform: str):
     import webbrowser
 
     _PLATFORM_HOME = {
-        "x":         "https://x.com",
         "instagram": "https://www.instagram.com",
         "facebook":  "https://www.facebook.com",
         "tiktok":    "https://www.tiktok.com",
-        "threads":   "https://www.threads.com",
     }
     url = _PLATFORM_HOME.get(platform)
     if not url:
@@ -496,109 +488,6 @@ def _wait_for_content(page: Page, selector: str, timeout: int = 15000):
         page.wait_for_selector(selector, timeout=timeout)
     except Exception:
         pass
-
-
-# ──────────────────────────────────────────────
-# X (Twitter)
-# ──────────────────────────────────────────────
-
-def _x_is_logged_in(page: Page) -> bool:
-    for selector in [
-        '[data-testid="SideNav_AccountSwitcher_Button"]',
-        '[data-testid="AppTabBar_Home_Link"]',
-        'a[href="/home"]',
-    ]:
-        try:
-            page.wait_for_selector(selector, timeout=3000)
-            return True
-        except Exception:
-            pass
-    return False
-
-
-def _x_ensure_login(page: Page):
-    safe_goto(page, "https://x.com/")
-    if _x_is_logged_in(page):
-        print("[X] 检测到已登录，直接开始抓取。")
-    else:
-        print("[X] 尚未登录，请在浏览器中完成登录后按 Enter 继续...")
-        input()
-        page.wait_for_load_state("load", timeout=60000)
-
-
-def _x_extract_views(aria_label: str) -> int | None:
-    m = re.search(r'([\d,]+)\s+views', aria_label)
-    if m:
-        return int(m.group(1).replace(",", ""))
-    return None
-
-
-def scrape_x(urls: list[str], check_login: bool = True) -> dict[str, list[dict]]:
-    results: dict[str, list[dict]] = {}
-    _, context = _ensure_context("x")
-    page = _get_or_new_page(context)
-    if check_login:
-        _x_ensure_login(page)
-    for url in urls:
-        print(f"\n[X] 正在访问：{url}")
-        try:
-            safe_goto(page, url)
-        except Exception as e:
-            print(f"[X] 网络错误，跳过当前账号，已保留 {len(results)} 个结果：{e}")
-            results[url] = []
-            continue
-        time.sleep(3)
-        _wait_for_content(page, '[data-testid="tweet"]')
-
-        seen: set[str] = set()
-        items: list[dict] = []
-        last_count = 0
-        no_new = 0
-
-        while True:
-            for tweet in page.query_selector_all('[data-testid="tweet"]'):
-                link_el = tweet.query_selector('a[href*="/status/"]')
-                tid = link_el.get_attribute("href") if link_el else None
-                if not tid or tid in seen:
-                    continue
-                seen.add(tid)
-
-                # 过滤转发
-                ctx = tweet.query_selector('[data-testid="socialContext"]')
-                if ctx:
-                    t = ctx.inner_text().strip().lower()
-                    if "reposted" in t or "转发" in t:
-                        continue
-
-                # 获取浏览量
-                views_el = tweet.query_selector('[aria-label*="views. View post analytics"]')
-                if not views_el:
-                    views_el = tweet.query_selector('[role="group"][aria-label*="views"]')
-                if not views_el:
-                    continue
-
-                vc = _x_extract_views(views_el.get_attribute("aria-label") or "")
-                if vc is None:
-                    continue
-
-                items.append({"index": len(items) + 1, "views": vc,
-                              "url": url, "href": "https://x.com" + tid})
-
-            cur = len(items)
-            print(f"[X]   已收集 {cur} 条原创推文...")
-            if cur == last_count:
-                no_new += 1
-                if no_new >= 3:
-                    break
-            else:
-                no_new = 0
-            last_count = cur
-            scroll_until_stable(page)
-            _wait_for_content(page, '[data-testid="tweet"]')
-
-        results[url] = items
-    _close_platform_context("x")
-    return results
 
 
 # ──────────────────────────────────────────────
@@ -988,238 +877,6 @@ def scrape_tiktok(urls: list[str], check_login: bool = True) -> dict[str, list[d
 
 
 # ──────────────────────────────────────────────
-# Threads
-# ──────────────────────────────────────────────
-# 主页不显示浏览量，需先收集帖子链接再逐条进详情页提取。
-# 该类名同时用于导航/用户名等文本，必须配合"次浏览/views"文本模式过滤。
-THREADS_VIEW_SELECTOR = "span.x1lliihq.x193iq5w.x6ikm8r.x10wlt62.xlyipyv.xuxw1ft"
-_THREADS_VIEW_RE = re.compile(r'(次浏览|次瀏覽|views?)\s*$', re.IGNORECASE)
-_THREADS_POST_LINK = 'a[href*="/post/"]'
-_THREADS_PATH_RE = re.compile(r'/(@[^/]+)/post/([^/]+)')
-
-# 滚动收集的到底判据：连续这么多秒没有出现新帖子链接就结束
-_THREADS_NO_NEW_SECONDS = 10.0
-
-# 详情页并行标签数：N 个标签同时加载，再依次收割浏览量。
-# 若遇到限流/页面加载不稳，调回 1 即退化为原来的串行流程。
-THREADS_POST_CONCURRENCY = 4
-
-# 浏览量只是一个文本 span，图片/视频/字体全部不需要，拦掉可省去详情页大半加载时间
-_THREADS_BLOCK_TYPES = {"image", "media", "font"}
-
-
-def _threads_block_heavy(route):
-    try:
-        if route.request.resource_type in _THREADS_BLOCK_TYPES:
-            route.abort()
-        else:
-            route.continue_()
-    except Exception:
-        pass
-
-
-def _threads_ensure_login(page: Page):
-    safe_goto(page, "https://www.threads.com/", wait_until="domcontentloaded")
-    time.sleep(3)
-    if page.query_selector('a[href*="/login"]') is None:
-        print("[TH] 检测到已登录，直接开始抓取。")
-    else:
-        print("[TH] 尚未登录，请在浏览器中完成登录后按 Enter 继续...")
-        input()
-
-
-# 找到浏览量文本的 JS（找不到返回 null）。等待与提取共用同一判据：
-# THREADS_VIEW_SELECTOR 是通用类名，导航/用户名也命中，只等类名出现会在
-# 浏览量尚未渲染时就返回，必须以"文本匹配次浏览/views"为准。
-_THREADS_VIEW_FIND_JS = """
-    () => {
-        const pat = /(次浏览|次瀏覽|views?)\\s*$/i;
-        const hit = (list) => {
-            for (const span of list) {
-                const t = (span.innerText || "").trim();
-                if (t.length < 30 && pat.test(t)) return t;
-            }
-            return null;
-        };
-        // 第二个 hit 是兜底：类名可能随版本变化
-        return hit(document.querySelectorAll("%s")) || hit(document.querySelectorAll("span"));
-    }
-""" % THREADS_VIEW_SELECTOR
-
-
-def _threads_wait_views(page: Page, timeout: int = 15000):
-    """等到浏览量文本真正渲染出来。polling 必须显式给毫秒数：
-    默认的 raf 轮询在后台标签页会被暂停，并行加载时大部分标签都是后台的。"""
-    try:
-        page.wait_for_function(
-            f"() => ({_THREADS_VIEW_FIND_JS})() !== null",
-            timeout=timeout, polling=300)
-    except Exception:
-        pass
-
-
-def _threads_extract_views(page: Page) -> int | None:
-    """在帖子详情页提取浏览量（如 '3.3 万次浏览' / '1,234 views'），整页仅主帖一处"""
-    text = page.evaluate(_THREADS_VIEW_FIND_JS)
-    if not text:
-        return None
-    return parse_view_count(_THREADS_VIEW_RE.sub("", text).strip())
-
-
-def _threads_post_paths(page: Page) -> list[tuple[str, str]]:
-    """
-    取当前页面上的帖子链接，返回 [(path, account)]，path 形如 /@user/post/xxx。
-    去掉 query 并排除 /media 等子页。主页是虚拟滚动、DOM 节点会被回收重排，
-    所以一切"是否还有新内容"的判断都要基于这里的 path 集合，不能用 DOM 节点数。
-    """
-    from urllib.parse import urlparse
-    hrefs = page.evaluate(f"""
-        () => Array.from(document.querySelectorAll('{_THREADS_POST_LINK}'))
-                  .map(a => a.getAttribute('href'))
-    """) or []
-    out: list[tuple[str, str]] = []
-    for href in hrefs:
-        if not href:
-            continue
-        path = href.split("?")[0]
-        if path.startswith("http"):
-            path = urlparse(path).path
-        pm = _THREADS_PATH_RE.fullmatch(path)
-        if pm:
-            out.append((path, pm.group(1)))
-    return out
-
-
-def _threads_scroll_step(page: Page, seen: set[str],
-                         poll: float = 0.3, timeout: float = 4.0):
-    """滚动一屏并等到出现 seen 之外的新帖子链接就返回，避免固定 sleep + networkidle 空耗"""
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(poll)
-        try:
-            if any(p not in seen for p, _ in _threads_post_paths(page)):
-                return
-        except Exception:
-            return
-
-
-def _threads_collect_views(context, post_paths: list[str], src_url: str) -> list[dict]:
-    """
-    多标签并行取浏览量：先给每个标签发起导航（commit 即返回，加载在后台并行进行），
-    再依次等待各标签的浏览量 span 出现并提取。
-    """
-    items: list[dict] = []
-    if not post_paths:
-        return items
-
-    lanes = max(1, min(THREADS_POST_CONCURRENCY, len(post_paths)))
-    pages: list[Page] = [_get_or_new_page(context)]
-    extra: list[Page] = []
-    for _ in range(lanes - 1):
-        pg = context.new_page()
-        extra.append(pg)
-        pages.append(pg)
-
-    try:
-        # 在 context 上注册，对批次内所有标签（含后续新建）统一生效
-        context.route("**/*", _threads_block_heavy)
-
-        for start in range(0, len(post_paths), lanes):
-            batch = post_paths[start:start + lanes]
-            loaded: list[tuple[Page, str]] = []
-            # 阶段一：并行发起导航
-            for pg, path in zip(pages, batch):
-                post_url = "https://www.threads.com" + path
-                try:
-                    safe_goto(pg, post_url, wait_until="commit")
-                    loaded.append((pg, post_url))
-                except Exception as e:
-                    print(f"[TH] 帖子打开失败，跳过：{post_url}（{e}）")
-            # 阶段二：依次收割
-            for pg, post_url in loaded:
-                _threads_wait_views(pg)
-                try:
-                    vc = _threads_extract_views(pg)
-                except Exception as e:
-                    print(f"[TH] 帖子解析失败，跳过：{post_url}（{e}）")
-                    continue
-                if vc is None:
-                    print(f"[TH]   未找到浏览量：{post_url}")
-                    continue
-                items.append({"index": len(items) + 1, "views": vc,
-                              "url": src_url, "href": post_url})
-                print(f"[TH]   {len(items):>3}: {vc:>12,} 次  {post_url}")
-    finally:
-        try:
-            context.unroute("**/*", _threads_block_heavy)
-        except Exception:
-            pass
-        for pg in extra:
-            try:
-                pg.close()
-            except Exception:
-                pass
-    return items
-
-
-def scrape_threads(urls: list[str], check_login: bool = True) -> dict[str, list[dict]]:
-    results: dict[str, list[dict]] = {}
-    _, context = _ensure_context("threads")
-    page = _get_or_new_page(context)
-    if check_login:
-        _threads_ensure_login(page)
-
-    for url in urls:
-        print(f"\n[TH] 正在访问：{url}")
-        try:
-            safe_goto(page, url, wait_until="domcontentloaded")
-        except Exception as e:
-            print(f"[TH] 网络错误，跳过当前账号，已保留 {len(results)} 个结果：{e}")
-            results[url] = []
-            continue
-        _wait_for_content(page, _THREADS_POST_LINK)
-
-        # 从主页 URL 提取用户名，只收集该用户自己的帖子（转发的 href 是他人用户名）
-        m = re.search(r'threads\.(?:com|net)/(@[^/?#]+)', url)
-        account = m.group(1) if m else None
-
-        # 第一步：滚动主页收集帖子链接
-        post_paths: list[str] = []
-        seen_paths: set[str] = set()
-        # seen_any 含他人转发，作为"页面还在出新内容"的信号；只看 post_paths
-        # 会在连续几屏都是转发时误判到底
-        seen_any: set[str] = set()
-        last_printed = -1
-        last_progress = time.time()
-        while True:
-            for path, acc in _threads_post_paths(page):
-                if path not in seen_any:
-                    seen_any.add(path)
-                    last_progress = time.time()
-                if account and acc != account:
-                    continue
-                if path in seen_paths:
-                    continue
-                seen_paths.add(path)
-                post_paths.append(path)
-
-            if len(post_paths) != last_printed:
-                print(f"[TH]   已收集 {len(post_paths)} 条帖子链接...")
-                last_printed = len(post_paths)
-            if time.time() - last_progress >= _THREADS_NO_NEW_SECONDS:
-                print(f"[TH]   {_THREADS_NO_NEW_SECONDS:.0f} 秒无新内容，"
-                      f"收集结束，共 {len(post_paths)} 条")
-                break
-            _threads_scroll_step(page, seen_any)
-
-        # 第二步：多标签并行访问帖子详情页，提取浏览量
-        results[url] = _threads_collect_views(context, post_paths, url)
-    _close_platform_context("threads")
-    return results
-
-
-# ──────────────────────────────────────────────
 # 工具：从 URL 提取账号名
 # ──────────────────────────────────────────────
 
@@ -1259,9 +916,7 @@ def print_results(platform: str, all_results: dict[str, list[dict]]):
 # Google Sheets 读取
 # ──────────────────────────────────────────────
 
-_PLATFORM_KW = ["x.com", "twitter.com", "instagram.com",
-                "facebook.com", "tiktok.com", "youtube.com",
-                "threads.com", "threads.net"]
+_PLATFORM_KW = [keyword for keyword, _ in _PLATFORM_RULES]
 
 
 def _read_xlsx(xlsx_path: str, label: str = "Sheet") -> dict[str, dict]:
@@ -1426,6 +1081,7 @@ def fetch_google_sheet_urls() -> dict[str, dict]:
     """
     import tempfile
     import urllib.request
+    import zipfile
 
     if not GOOGLE_SHEET_URL:
         return {}
@@ -1474,6 +1130,7 @@ def fetch_google_sheet_urls() -> dict[str, dict]:
                 user_data_dir=profile_dir,
                 executable_path=CHROME_PATH,
                 headless=False,
+                accept_downloads=True,
                 args=["--disable-blink-features=AutomationControlled"],
                 viewport={"width": 1280, "height": 900},  # type: ignore[arg-type]
                 locale="zh-CN",
@@ -1494,19 +1151,43 @@ def fetch_google_sheet_urls() -> dict[str, dict]:
 
             print("[Google] 开始下载 xlsx...")
             try:
-                with page.expect_download(timeout=30000) as dl_info:
+                # 复用登录 Cookie，直接读取响应，避免依赖 Chrome 的下载生命周期。
+                try:
+                    response = context.request.get(export_url, timeout=60000)
                     try:
-                        page.goto(export_url, timeout=10000)
-                    except Exception:
-                        pass
-                dl_info.value.save_as(tmp_path)
+                        if not response.ok:
+                            raise RuntimeError(f"导出接口返回 HTTP {response.status}")
+                        body = response.body()
+                        if not body.startswith(b"PK\x03\x04"):
+                            raise RuntimeError("导出接口未返回 xlsx，可能需要登录或缺少导出权限")
+                        with open(tmp_path, "wb") as f:
+                            f.write(body)
+                    finally:
+                        response.dispose()
+                except Exception as request_error:
+                    print(f"[Google] 会话直接下载失败，尝试浏览器下载: {request_error}")
+                    with page.expect_download(timeout=60000) as dl_info:
+                        try:
+                            page.goto(export_url, timeout=60000)
+                        except Exception as navigation_error:
+                            # 导出导航触发下载时，Chrome 会中止导航，这是预期行为。
+                            if "net::ERR_ABORTED" not in str(navigation_error) and "Download is starting" not in str(navigation_error):
+                                raise
+                    dl_info.value.save_as(tmp_path)
+                with zipfile.ZipFile(tmp_path) as zf:
+                    if "xl/workbook.xml" not in zf.namelist():
+                        raise RuntimeError("下载内容不是有效的 Excel 工作簿")
                 print(f"[Google] xlsx 已下载: {tmp_path}")
             except Exception as e:
                 print(f"[Google] 下载失败: {e}")
-                context.close()
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
                 return {}
-
-            context.close()
+            finally:
+                try:
+                    context.close()
+                except Exception as close_error:
+                    print(f"[Google] 清理浏览器时出错: {close_error}")
 
     url_meta = _read_xlsx(tmp_path, label="Google")
     print(f"[Google] 共读取 {len(url_meta)} 条 URL")
@@ -1595,7 +1276,7 @@ def export_excel(all_platform_results: dict[str, dict]):
 
 
 # ──────────────────────────────────────────────
-# 主入口：并行抓取四个平台
+# 主入口：并行抓取 Instagram、Facebook、TikTok
 # ──────────────────────────────────────────────
 
 def main(check_login: bool = False, test_mode: bool = False):
@@ -1610,14 +1291,14 @@ def main(check_login: bool = False, test_mode: bool = False):
             URLS = list(sheet_map.keys())
             print(f"\n[Google] 共读取 {len(URLS)} 条 URL，开始抓取...\n")
         else:
+            if not URLS:
+                raise RuntimeError("Google 表格读取失败或没有有效的平台 URL，且未配置静态 URL；本次抓取未完成。")
             print("[Google] 未从表格读取到有效 URL，使用配置中的静态 URLS")
 
     scrape_fn = {
-        "X":         scrape_x,
         "Instagram": scrape_instagram,
         "Facebook":  scrape_facebook,
         "TikTok":    scrape_tiktok,
-        "Threads":   scrape_threads,
     }
 
     grouped = group_urls_by_platform(URLS)

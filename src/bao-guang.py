@@ -1385,3 +1385,4 @@ if __name__ == "__main__":
             _wait_until_next_8am()
         except KeyboardInterrupt:
             break
+
